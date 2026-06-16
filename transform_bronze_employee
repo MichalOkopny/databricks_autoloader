@@ -1,0 +1,49 @@
+# Databricks notebook source
+from pyspark.sql.functions import input_file_name, current_timestamp
+from pyspark.sql import SparkSession
+from pyspark.sql import DataFrame
+
+
+def transform_bronze_employee(df: DataFrame) -> DataFrame:
+    """Add ingestion metadata columns to raw employee records.
+
+    Args:
+        df: Raw streaming DataFrame from Autoloader.
+
+    Returns:
+        DataFrame with source_file_name, ingestion_timestamp appended
+        and 'State short' renamed to state_code.
+    """
+    return df \
+        .withColumn("source_file_name", input_file_name()) \
+        .withColumn("ingestion_timestamp", current_timestamp()) \
+        .withColumnRenamed("State short", "state_code")
+
+
+# COMMAND ----------
+
+if __name__ == "__main__" or "dbutils" in globals():
+    spark = SparkSession.builder.getOrCreate()
+
+    source_path     = "abfss://raw@mokopnypoca1.dfs.core.windows.net/employees/"
+    schema_location = "abfss://catalog@mokopnypoca1.dfs.core.windows.net/transform/bronze/_schemas/employee/"
+    checkpoint_path = "abfss://catalog@mokopnypoca1.dfs.core.windows.net/transform/bronze/_checkpoints/employee/"  # fix: was 'emoloyee'
+
+    df_raw = (
+        spark.readStream.format("cloudFiles")
+        .option("cloudFiles.format", "csv")
+        .option("cloudFiles.schemaLocation", schema_location)
+        .option("header", True)
+        .load(source_path)
+    )
+
+    df_bronze = transform_bronze_employee(df_raw)
+
+    (
+        df_bronze.writeStream.format("delta")
+        .option("checkpointLocation", checkpoint_path)
+        .option("mergeSchema", True)
+        .trigger(availableNow=True)
+        .outputMode("append")
+        .toTable("bronze.employee")
+    )
