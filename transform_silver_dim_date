@@ -1,0 +1,37 @@
+# Databricks notebook source
+from pyspark.sql.functions import date_format, col, year, month, dayofmonth, dayofweek
+from pyspark.sql import SparkSession
+from pyspark.sql import DataFrame
+
+
+def silver_dim_date(df_dates: DataFrame) -> DataFrame:
+    """Build the date dimension from a sequence of dates.
+
+    Args:
+        df_dates: DataFrame with a single 'date' column (DateType).
+
+    Returns:
+        DataFrame with PK, day_of_month, day_of_week, month, year columns.
+    """
+    return df_dates \
+        .withColumn("PK", date_format(col("date"), "yyyyMMdd").cast("int")) \
+        .withColumn("day_of_month", dayofmonth(col("date"))) \
+        .withColumn("day_of_week", dayofweek(col("date"))) \
+        .withColumn("month", month(col("date"))) \
+        .withColumn("year", year(col("date")))
+
+
+# COMMAND ----------
+
+if __name__ == "__main__" or "dbutils" in globals():
+    spark = SparkSession.builder.getOrCreate()
+
+    df_dates = spark.sql(
+        "SELECT explode(sequence(to_date('2010-01-01'), current_date(), interval 1 day)) AS date"
+    )
+
+    df_dim_date = silver_dim_date(df_dates)
+
+    df_dim_date.write.format("delta") \
+        .mode("overwrite") \
+        .saveAsTable("silver.dim_date")
