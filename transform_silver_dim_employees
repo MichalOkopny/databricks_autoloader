@@ -1,0 +1,125 @@
+# Databricks notebook source
+from pyspark.sql.functions import col, row_number, lower, trim, when, split, initcap, monotonically_increasing_id
+from pyspark.sql.window import Window
+from pyspark.sql import DataFrame
+
+from common.snapshot_utils import get_latest_snapshot
+
+
+def get_latest_records(df: DataFrame, partition_col: str) -> DataFrame:
+    """Deduplicate records using SCD Type 1 strategy.
+
+    Keeps only the most recent record per partition key,
+    ordered by ingestion_timestamp descending.
+
+    Args:
+        df: Input DataFrame with an 'ingestion_timestamp' column.
+        partition_col: Column name to partition (deduplicate) by.
+
+    Returns:
+        DataFrame with one row per unique partition_col value.
+    """
+    window = Window.partitionBy(partition_col).orderBy(col("ingestion_timestamp").desc())
+    return df.withColumn("rn", row_number().over(window)).filter(col("rn") == 1).drop("rn")
+
+
+# COMMAND ----------
+
+def clean_emp(df: DataFrame) -> DataFrame:
+    """Clean and standardize employee records.
+
+    Applies the following transformations:
+        - Extracts city name before the comma separator.
+        - Splits 'name' into 'first_name' and 'last_name' (title-cased).
+        - Extracts 'street' from pipe-delimited 'address'.
+        - Lowercases 'email' and 'department'.
+        - Replaces literal 'none'/'null' strings with SQL NULL
+          across: department, address, city, email, name, status.
+
+    Args:
+        df: Deduplicated employee DataFrame from bronze layer.
+
+    Returns:
+        Cleaned DataFrame with additional columns: first_name, last_name, street.
+    """
+    df = df \
+        .withColumn("city", split(trim(col("city")), ",").getItem(0)) \
+        .withColumn("first_name", initcap(split(trim(col("name")), " ").getItem(0))) \
+        .withColumn("last_name", initcap(split(trim(col("name")), " ").getItem(1))) \
+        .withColumn("street", split(trim(col("address")), "\\|").getItem(0)) \
+        .withColumn("email", lower(col("email"))) \
+        .withColumn("department", lower(col("department")))
+
+    for c in ["department", "address", "city", "email", "name", "status"]:
+        df = df.withColumn(c, trim(col(c)))
+        df = df.withColumn(c, when(lower(col(c)).isin(["none", "null"]), None).otherwise(col(c)))
+    return df
+
+
+# COMMAND ----------
+
+def enrich_emp(df_emp: DataFrame, df_map: DataFrame) -> DataFrame:
+    """Enrich employee data with state_code from city-state mapping.
+
+    Left-joins employees with the mapping table on city,
+    then drops auxiliary columns not needed in the silver layer.
+
+    Args:
+        df_emp: Cleaned employee DataFrame (must contain 'city' column).
+        df_map: City-state mapping DataFrame (must contain 'City', 'state_code').
+
+    Returns:
+        Enriched DataFrame with 'state_code' added; drops
+        city_dict, source_file_name, ingestion_timestamp, id, name, address.
+    """
+    return df_emp.join(
+        df_map.select(col("City").alias("city_dict"), col("state_code")),
+        df_emp.city == col("city_dict"),
+        "left"
+    ).drop("city_dict", "source_file_name", "ingestion_timestamp", "id", "name", "address")
+
+
+# COMMAND ----------
+
+def transform_employees(df_bronze_emp: DataFrame, df_bronze_map: DataFrame) -> DataFrame:
+    """Orchestrate the full bronze-to-silver employee transformation.
+
+    Since raw files are full snapshots, only the newest snapshot is read
+    from bronze (via get_latest_snapshot) and used to overwrite silver.
+    Pipeline: latest snapshot → deduplicate → clean → enrich → surrogate PK.
+
+    Args:
+        df_bronze_emp: Full bronze employee DataFrame (all historical appends).
+        df_bronze_map: Full bronze mapping DataFrame (all historical appends).
+
+    Returns:
+        Silver-layer DataFrame ready to overwrite silver.dim_employees.
+    """
+    # Only process the most recent snapshot from each bronze table
+    df_emp_snapshot = get_latest_snapshot(df_bronze_emp)
+    df_map_snapshot = get_latest_snapshot(df_bronze_map)
+
+    df_emp_deduped = get_latest_records(df_emp_snapshot, "email")
+    df_map_deduped = get_latest_records(df_map_snapshot, "City")
+
+    df_clean = clean_emp(df_emp_deduped)
+    df_enriched = enrich_emp(df_clean, df_map_deduped)
+    df_enriched = df_enriched.withColumn("PK", monotonically_increasing_id())
+    return df_enriched
+
+
+# COMMAND ----------
+
+if __name__ == "__main__":
+    from pyspark.sql import SparkSession
+    spark = SparkSession.builder.getOrCreate()
+
+    df_bronze_emp = spark.table("bronze.employee")
+    df_bronze_map = spark.table("bronze.city_state_mapping")
+
+    df_final = transform_employees(df_bronze_emp, df_bronze_map)
+
+    # Overwrite — silver always reflects the latest full snapshot
+    df_final.write.format("delta") \
+        .mode("overwrite") \
+        .saveAsTable("silver.dim_employees")
