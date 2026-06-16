@@ -1,0 +1,47 @@
+# Databricks notebook source
+from pyspark.sql.functions import current_timestamp, input_file_name
+from pyspark.sql import SparkSession
+from pyspark.sql import DataFrame
+
+
+def transform_bronze_orders(df: DataFrame) -> DataFrame:
+    """Add ingestion metadata columns to raw orders.
+
+    Args:
+        df: Raw streaming DataFrame from Autoloader.
+
+    Returns:
+        DataFrame with source_file_name and ingestion_timestamp appended.
+    """
+    return df \
+        .withColumn("source_file_name", input_file_name()) \
+        .withColumn("ingestion_timestamp", current_timestamp())
+
+
+# COMMAND ----------
+
+if __name__ == "__main__" or "dbutils" in globals():
+    spark = SparkSession.builder.getOrCreate()
+
+    source_path      = "abfss://raw@mokopnypoca1.dfs.core.windows.net/orders/"
+    checkpoint_path  = "abfss://catalog@mokopnypoca1.dfs.core.windows.net/transform/bronze/_checkpoints/orders/"
+    schema_location  = "abfss://catalog@mokopnypoca1.dfs.core.windows.net/transform/bronze/_schemas/orders/"
+
+    df_raw = (
+        spark.readStream.format("cloudFiles")
+        .option("cloudFiles.format", "json")
+        .option("cloudFiles.schemaLocation", schema_location)
+        .option("cloudFiles.inferColumnTypes", True)
+        .load(source_path)
+    )
+
+    df_bronze = transform_bronze_orders(df_raw)
+
+    (
+        df_bronze.writeStream.format("delta")
+        .option("checkpointLocation", checkpoint_path)
+        .option("mergeSchema", True)
+        .trigger(availableNow=True)
+        .outputMode("append")
+        .toTable("bronze.orders")
+    )
