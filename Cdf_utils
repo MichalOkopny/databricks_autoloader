@@ -1,0 +1,126 @@
+from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql.functions import col
+from delta.tables import DeltaTable
+
+META_TABLE = "meta.cdf_versions"
+META_PATH = "abfss://catalog@mokopnypoca1.dfs.core.windows.net/meta/cdf_versions/"
+
+
+def init_cdf_meta_table(spark: SparkSession) -> None:
+    """Create the CDF version tracking meta-table if it does not exist.
+
+    The table stores the last successfully processed Delta table version
+    for each tracked upstream table. On first run, a row is inserted with
+    the current version of the upstream table so that only future changes
+    are processed (start-fresh behaviour).
+
+    Args:
+        spark: Active SparkSession.
+    """
+    spark.sql(f"""
+        CREATE TABLE IF NOT EXISTS {META_TABLE} (
+            table_name  STRING NOT NULL,
+            last_version BIGINT NOT NULL
+        )
+        USING DELTA
+        LOCATION '{META_PATH}'
+    """)
+
+
+def get_last_processed_version(spark: SparkSession, table_name: str) -> int | None:
+    """Return the last processed Delta version for *table_name*.
+
+    Args:
+        spark: Active SparkSession.
+        table_name: Fully-qualified Delta table name (e.g. 'bronze.orders').
+
+    Returns:
+        The last processed version as an integer, or None if no record exists
+        yet (i.e. first run).
+    """
+    df = spark.sql(f"""
+        SELECT last_version
+        FROM {META_TABLE}
+        WHERE table_name = '{table_name}'
+    """)
+    row = df.first()
+    return int(row["last_version"]) if row else None
+
+
+def set_last_processed_version(spark: SparkSession, table_name: str, version: int) -> None:
+    """Upsert the last processed version for *table_name* into the meta-table.
+
+    Args:
+        spark: Active SparkSession.
+        table_name: Fully-qualified Delta table name.
+        version: The Delta version that was just successfully processed.
+    """
+    spark.sql(f"""
+        MERGE INTO {META_TABLE} AS target
+        USING (SELECT '{table_name}' AS table_name, {version} AS last_version) AS source
+        ON target.table_name = source.table_name
+        WHEN MATCHED THEN
+            UPDATE SET target.last_version = source.last_version
+        WHEN NOT MATCHED THEN
+            INSERT (table_name, last_version) VALUES (source.table_name, source.last_version)
+    """)
+
+
+def get_current_version(spark: SparkSession, table_name: str) -> int:
+    """Return the latest committed Delta version for *table_name*.
+
+    Args:
+        spark: Active SparkSession.
+        table_name: Fully-qualified Delta table name.
+
+    Returns:
+        Current Delta table version as an integer.
+    """
+    history = spark.sql(f"DESCRIBE HISTORY {table_name} LIMIT 1")
+    return int(history.first()["version"])
+
+
+def read_cdf(spark: SparkSession, table_name: str) -> tuple[DataFrame | None, int]:
+    """Read incremental changes from a CDF-enabled Delta table.
+
+    On the very first run (no version tracked), the current version is recorded
+    and None is returned — no data is processed, establishing the baseline.
+    On subsequent runs, CDF is read from (last_version + 1) to the current version,
+    filtering to INSERT and UPDATE_POSTIMAGE rows only.
+
+    Args:
+        spark: Active SparkSession.
+        table_name: Fully-qualified CDF-enabled Delta table name.
+
+    Returns:
+        A tuple of (DataFrame | None, current_version):
+            - DataFrame with new/changed rows, or None on first run.
+            - The current Delta version (to be saved after successful processing).
+    """
+    current_version = get_current_version(spark, table_name)
+    last_version = get_last_processed_version(spark, table_name)
+
+    # First run — record baseline version, skip processing
+    if last_version is None:
+        set_last_processed_version(spark, table_name, current_version)
+        print(f"[CDF] First run for '{table_name}'. Baseline set to version {current_version}. No data processed.")
+        return None, current_version
+
+    # Nothing new since last run
+    if last_version >= current_version:
+        print(f"[CDF] No new versions for '{table_name}' (last={last_version}, current={current_version}).")
+        return None, current_version
+
+    from_version = last_version + 1
+    print(f"[CDF] Reading '{table_name}' versions {from_version} → {current_version}.")
+
+    df_cdf = (
+        spark.read.format("delta")
+        .option("readChangeFeed", "true")
+        .option("startingVersion", from_version)
+        .option("endingVersion", current_version)
+        .table(table_name)
+        .filter(col("_change_type").isin("insert", "update_postimage"))
+        .drop("_change_type", "_commit_version", "_commit_timestamp")
+    )
+    return df_cdf, current_version
