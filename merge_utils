@@ -1,0 +1,36 @@
+from pyspark.sql import SparkSession, DataFrame
+from delta.tables import DeltaTable
+
+
+def merge_gold_orders(spark: SparkSession, df_new: DataFrame, target_table: str) -> None:
+    """MERGE incremental gold order aggregates into the target table.
+
+    Matches on (employee_fk, date_fk). When a match is found the additive
+    metrics are updated in-place; when no match exists a new row is inserted.
+
+    Additive metrics updated on MATCH:
+        - total_orders   → accumulated order count
+        - total_quantity → accumulated quantity
+        - daily_revenue  → accumulated revenue (rounded to 2 dp)
+        - avg_unit_price → recalculated weighted average
+
+    Args:
+        spark: Active SparkSession.
+        df_new: DataFrame with freshly aggregated incremental gold rows.
+            Must contain: employee_fk, date_fk, total_orders, total_quantity,
+            daily_revenue, avg_unit_price.
+        target_table: Fully-qualified name of the gold Delta table
+            (e.g. 'gold.orders').
+    """
+    delta_target = DeltaTable.forName(spark, target_table)
+
+    delta_target.alias("target").merge(
+        df_new.alias("source"),
+        "target.employee_fk = source.employee_fk AND target.date_fk = source.date_fk"
+    ).whenMatchedUpdate(set={
+        "total_orders":    "target.total_orders + source.total_orders",
+        "total_quantity":  "target.total_quantity + source.total_quantity",
+        # Weighted average: recalculate from combined totals
+        "avg_unit_price":  "round((target.avg_unit_price * target.total_orders + source.avg_unit_price * source.total_orders) / (target.total_orders + source.total_orders), 2)",
+        "daily_revenue":   "round(target.daily_revenue + source.daily_revenue, 2)",
+    }).whenNotMatchedInsertAll().execute()
