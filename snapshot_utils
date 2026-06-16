@@ -1,0 +1,25 @@
+from pyspark.sql import DataFrame
+from pyspark.sql.functions import col, max as spark_max
+
+
+def get_latest_snapshot(df: DataFrame, timestamp_col: str = "ingestion_timestamp") -> DataFrame:
+    """Filter a bronze DataFrame to rows belonging to the most recent snapshot.
+
+    Used for dimension tables where each raw file is a full snapshot and only
+    the newest snapshot should be promoted to silver (SCD Type 1).
+
+    The most recent snapshot is identified by the maximum value of
+    *timestamp_col* across the entire DataFrame. All rows whose timestamp
+    equals that maximum are returned.
+
+    Args:
+        df: Bronze DataFrame containing a timestamp column produced by
+            Autoloader (e.g. current_timestamp() at ingestion time).
+        timestamp_col: Name of the ingestion timestamp column.
+            Defaults to 'ingestion_timestamp'.
+
+    Returns:
+        DataFrame filtered to only rows from the latest snapshot batch.
+    """
+    latest_ts = df.agg(spark_max(col(timestamp_col))).first()[0]
+    return df.filter(col(timestamp_col) == latest_ts)
