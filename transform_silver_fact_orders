@@ -1,0 +1,125 @@
+# Databricks notebook source
+from pyspark.sql.functions import col, lower
+from pyspark.sql import DataFrame
+
+from common.cdf_utils import init_cdf_meta_table, read_cdf, set_last_processed_version
+
+
+def prepare_employee_dim(df_dim_emp: DataFrame) -> DataFrame:
+    """Prepare the employee dimension DataFrame for joining.
+
+    Args:
+        df_dim_emp: Employee dimension table.
+
+    Returns:
+        DataFrame with employee email and foreign key only.
+    """
+    return df_dim_emp.select(
+        col("email"),
+        col("PK").alias("employee_fk")
+    )
+
+
+# COMMAND ----------
+
+def prepare_date_dim(dim_date: DataFrame) -> DataFrame:
+    """Prepare the date dimension DataFrame for joining.
+
+    Args:
+        dim_date: Date dimension table.
+
+    Returns:
+        DataFrame with date and foreign key only.
+    """
+    return dim_date.select(
+        col("date"),
+        col("PK").alias("date_fk")
+    )
+
+
+# COMMAND ----------
+
+def normalize_orders(df_orders: DataFrame) -> DataFrame:
+    """Normalize string columns in the orders DataFrame.
+
+    Args:
+        df_orders: Raw orders DataFrame.
+
+    Returns:
+        DataFrame with lowercased employee_email and product_category.
+    """
+    return df_orders \
+        .withColumn("employee_email", lower(col("employee_email"))) \
+        .withColumn("product_category", lower(col("product_category")))
+
+
+# COMMAND ----------
+
+def transform_orders(df_orders: DataFrame, dim_date: DataFrame, df_dim_emp: DataFrame) -> DataFrame:
+    """Transform incremental orders into fact table rows.
+
+    Joins the incremental orders slice with employee and date dimensions
+    to produce foreign-key enriched fact rows ready for silver.
+
+    Args:
+        df_orders: Incremental orders DataFrame (CDF slice from bronze).
+        dim_date: Full date dimension table from silver.
+        df_dim_emp: Full employee dimension table from silver.
+
+    Returns:
+        Fact DataFrame to be appended to silver.fact_orders.
+    """
+    df_emp_prepared  = prepare_employee_dim(df_dim_emp)
+    df_date_prepared = prepare_date_dim(dim_date)
+    df_normalized    = normalize_orders(df_orders)
+
+    df_fact = df_normalized.join(
+        df_emp_prepared,
+        df_normalized.employee_email == df_emp_prepared.email,
+        "left"
+    )
+    df_final_fact = df_fact.join(
+        df_date_prepared,
+        col("time").cast("date") == col("date"),
+        "left"
+    ).select(
+        col("id").alias("order_id"),
+        col("date_fk"),
+        col("employee_fk"),
+        col("quantity").cast("int"),
+        col("product_id"),
+        col("total_price").cast("double"),
+        col("unit_price").cast("double")
+    )
+    return df_final_fact
+
+
+# COMMAND ----------
+
+if __name__ == "__main__":
+    from pyspark.sql import SparkSession
+    spark = SparkSession.builder.getOrCreate()
+
+    BRONZE_TABLE = "bronze.orders"
+
+    init_cdf_meta_table(spark)
+
+    # Enable CDF on bronze.orders if not already enabled
+    spark.sql(f"ALTER TABLE {BRONZE_TABLE} SET TBLPROPERTIES (delta.enableChangeDataFeed = true)")
+
+    df_orders_cdf, current_version = read_cdf(spark, BRONZE_TABLE)
+
+    if df_orders_cdf is not None:
+        df_dim_date = spark.table("silver.dim_date")
+        df_dim_emp  = spark.table("silver.dim_employees")
+
+        df_fact = transform_orders(df_orders_cdf, df_dim_date, df_dim_emp)
+
+        df_fact.write.format("delta") \
+            .mode("append") \
+            .saveAsTable("silver.fact_orders")
+
+        set_last_processed_version(spark, BRONZE_TABLE, current_version)
+        print(f"[silver.fact_orders] Appended incremental data up to bronze version {current_version}.")
+    else:
+        print("[silver.fact_orders] No new data to process.")
